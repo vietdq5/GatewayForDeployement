@@ -57,8 +57,8 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 builder.Services.AddAuthorization();
 
 // Add Health Checks
-//builder.Services.AddHealthChecks();
-builder.Services.AddHealthChecks().AddCheck<HealthCheckService>("microservices_health");
+builder.Services.AddHealthChecks();
+// builder.Services.AddHealthChecks().AddCheck<HealthCheckService>("microservices_health");
 
 // Add HttpClient factory
 builder.Services.AddHttpClient();
