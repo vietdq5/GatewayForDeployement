@@ -1,0 +1,272 @@
+name: Build and Deploy Gateway to AKS
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  DOCKER_BUILDKIT: 1
+  HELM_VERSION: '3.13.0'
+
+jobs:
+  # Build and Test job
+  build-test:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      short-sha: ${{ steps.version.outputs.short-sha }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Generate version
+      id: version
+      run: |
+        # Generate semantic version based on tag or branch
+        if [[ $GITHUB_REF == refs/tags/v* ]]; then
+          VERSION=${GITHUB_REF#refs/tags/}
+        elif [[ $GITHUB_REF == refs/heads/main ]]; then
+          VERSION="v$(date +'%Y.%m.%d')-${GITHUB_SHA::8}"
+        else
+          VERSION="v$(date +'%Y.%m.%d')-dev-${GITHUB_SHA::8}"
+        fi
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+        echo "short-sha=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+        echo "Generated version: ${VERSION}"
+
+    - name: Restore dependencies
+      run: dotnet restore
+
+    - name: Build
+      run: dotnet build --configuration Release --no-restore
+
+    # - name: Run tests
+    #   run: |
+    #     # Add test project when available
+    #     # dotnet test --no-restore --verbosity normal --collect:"XPlat Code Coverage"
+    #     echo "No tests found, skipping..."
+
+    # - name: SonarQube Scan (Optional)
+    #   if: github.event_name != 'pull_request'
+    #   continue-on-error: true
+    #   env:
+    #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    #     SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    #   run: |
+    #     # Add SonarQube scanning if configured
+    #     echo "SonarQube scanning would run here if configured"
+
+  # Build and Push Docker Image
+  docker-build-push:
+    needs: build-test
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    
+    strategy:
+      matrix:
+        environment: [production]
+    
+    environment: ${{ matrix.environment }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Azure Container Registry
+      uses: azure/docker-login@v1
+      with:
+        login-server: ${{ secrets.ACR_LOGIN_SERVER }}
+        username: ${{ secrets.ACR_USERNAME }}
+        password: ${{ secrets.ACR_PASSWORD }}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        push: true
+        tags: |
+          ${{ secrets.ACR_LOGIN_SERVER }}/gateway:${{ needs.build-test.outputs.version }}
+          ${{ secrets.ACR_LOGIN_SERVER }}/gateway:${{ matrix.environment }}-latest
+          ${{ secrets.ACR_LOGIN_SERVER }}/gateway:${{ needs.build-test.outputs.short-sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          BUILD_CONFIGURATION=Release
+          VERSION=${{ needs.build-test.outputs.version }}
+        labels: |
+          org.opencontainers.image.source=${{ github.event.repository.html_url }}
+          org.opencontainers.image.revision=${{ github.sha }}
+          org.opencontainers.image.version=${{ needs.build-test.outputs.version }}
+          environment=${{ matrix.environment }}
+
+    # - name: Run Trivy vulnerability scanner
+    #   uses: aquasecurity/trivy-action@master
+    #   with:
+    #     image-ref: ${{ secrets.ACR_LOGIN_SERVER }}/gateway:${{ needs.build-test.outputs.version }}
+    #     format: 'sarif'
+    #     output: 'trivy-results.sarif'
+    #     severity: 'CRITICAL,HIGH'
+    #     exit-code: '0'
+
+    # - name: Upload Trivy results to GitHub Security
+    #   uses: github/codeql-action/upload-sarif@v3
+    #   if: always()
+    #   with:
+    #     sarif_file: 'trivy-results.sarif'
+
+  # Deploy to AKS
+  deploy:
+    needs: [build-test, docker-build-push]
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    
+    strategy:
+      matrix:
+        environment: [production]
+        exclude:
+          - environment: production
+            # Only deploy to production on main branch or tags
+            ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+    
+    environment: 
+      name: ${{ matrix.environment }}
+      url: ${{ steps.deploy.outputs.app-url }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: ${{ env.HELM_VERSION }}
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Set AKS Context
+      uses: azure/aks-set-context@v3
+      with:
+        cluster-name: ${{ vars.AKS_CLUSTER_NAME }}
+        resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
+        admin: 'false'
+        use-kubelogin: 'true'
+
+    - name: Create namespace if not exists
+      run: |
+        kubectl create namespace gateway-${{ matrix.environment }} --dry-run=client -o yaml | kubectl apply -f -
+
+    - name: Create image pull secret
+      run: |
+        kubectl create secret docker-registry acr-secret \
+          --namespace=gateway-${{ matrix.environment }} \
+          --docker-server=${{ secrets.ACR_LOGIN_SERVER }} \
+          --docker-username=${{ secrets.ACR_USERNAME }} \
+          --docker-password=${{ secrets.ACR_PASSWORD }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+    - name: Deploy with Helm
+      id: deploy
+      run: |
+        # Deploy using Helm
+        helm upgrade --install gateway-${{ matrix.environment }} ./helm-charts \
+          --namespace gateway-${{ matrix.environment }} \
+          --create-namespace \
+          --values ./helm-charts/values.${{ matrix.environment }}.yaml \
+          --set image.repository=${{ secrets.ACR_LOGIN_SERVER }}/gateway \
+          --set image.tag=${{ needs.build-test.outputs.version }} \
+          --set image.pullPolicy=Always \
+          --set imagePullSecrets[0].name=acr-secret \
+          --set env[0].name=ASPNETCORE_ENVIRONMENT \
+          --set env[0].value=${{ matrix.environment }} \
+          --set env[1].name=VERSION \
+          --set env[1].value=${{ needs.build-test.outputs.version }} \
+          --wait \
+          --timeout 5m \
+          --atomic
+
+        # Get the service URL
+        APP_URL=$(kubectl get svc gateway-${{ matrix.environment }} -n gateway-${{ matrix.environment }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        echo "app-url=http://${APP_URL}" >> $GITHUB_OUTPUT
+
+    - name: Verify deployment
+      run: |
+        kubectl rollout status deployment/gateway-${{ matrix.environment }} -n gateway-${{ matrix.environment }}
+        kubectl get pods -n gateway-${{ matrix.environment }}
+
+    - name: Run smoke tests
+      run: |
+        # Wait for service to be ready
+        sleep 30
+        
+        # Run basic health check
+        SERVICE_IP=$(kubectl get svc gateway-${{ matrix.environment }} -n gateway-${{ matrix.environment }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        
+        if [ ! -z "$SERVICE_IP" ]; then
+          curl -f http://${SERVICE_IP}/health || exit 1
+          echo "Health check passed!"
+        else
+          echo "Service IP not found, checking with port-forward..."
+          kubectl port-forward -n gateway-${{ matrix.environment }} service/gateway-${{ matrix.environment }} 8080:80 &
+          sleep 5
+          curl -f http://localhost:8080/health || exit 1
+          echo "Health check passed!"
+        fi
+
+    - name: Rollback on failure
+      if: failure()
+      run: |
+        echo "Deployment failed, rolling back..."
+        helm rollback gateway-${{ matrix.environment }} -n gateway-${{ matrix.environment }}
+
+  # Cleanup old images in ACR
+  cleanup-acr:
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Cleanup old images
+      run: |
+        # Keep only last 10 versions
+        az acr repository show-manifests \
+          --name ${{ secrets.ACR_NAME }} \
+          --repository gateway \
+          --orderby time_desc \
+          --query "[10:].digest" -o tsv | \
+        xargs -I% az acr repository delete \
+          --name ${{ secrets.ACR_NAME }} \
+          --image gateway@% --yes || true
